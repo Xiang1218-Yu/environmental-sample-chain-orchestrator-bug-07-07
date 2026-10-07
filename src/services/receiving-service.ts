@@ -1,10 +1,9 @@
-import type { ReceivingDecision } from '../domain/types.js';
-import { assertCondition, assertFound } from '../domain/errors.js';
+import type { ReceivingDecision, ReceivingRecord } from '../domain/types.js';
+import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { type Scope, assertScope, assertValidScope } from '../domain/scope.js';
 import { Store } from '../store/store.js';
 
-export interface ReceiveInput {
-  tenantId: string;
-  projectId: string;
+export interface ReceiveInput extends Scope {
   containerId: string;
   receivedBy: string;
   receivedAt: string;
@@ -18,14 +17,23 @@ export interface ReceiveInput {
 export class ReceivingService {
   constructor(private readonly store: Store) {}
 
-  receive(input: ReceiveInput) {
-    const duplicate = [...this.store.receiving.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId);
-    if (duplicate) return duplicate;
+  receive(input: ReceiveInput): ReceivingRecord {
+    assertValidScope(input);
+    // 接收操作号只在 (tenant, project) 内幂等；同号不同容器/结论属于冲突。
+    const duplicate = [...this.store.receiving.values()].find(
+      (item) => item.tenantId === input.tenantId && item.projectId === input.projectId && item.clientOperationId === input.clientOperationId,
+    );
+    if (duplicate) {
+      if (!this.sameReceivePayload(duplicate, input)) {
+        throw new DomainError('receiving.op_conflict', 'client operation id was submitted with a different receiving payload');
+      }
+      return duplicate;
+    }
     const container = assertFound(this.store.containers.get(input.containerId), 'receiving.container_not_found', 'container not found');
-    assertCondition(container.tenantId === input.tenantId && container.projectId === input.projectId, 'scope.forbidden', 'container is outside the requested project');
+    assertScope(container, input);
     assertCondition(container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'HANDED_OVER', 'receiving.invalid_state', 'container is not ready for receiving');
     const id = this.store.nextId('receiving');
-    const record = {
+    const record: ReceivingRecord = {
       id,
       tenantId: input.tenantId,
       projectId: input.projectId,
@@ -44,11 +52,22 @@ export class ReceivingService {
     container.sealStatus = input.sealStatus;
     container.version += 1;
     const sample = assertFound(this.store.samples.get(container.sampleId), 'receiving.sample_not_found', 'sample not found');
+    assertScope(sample, input);
     sample.status = input.decision === 'ACCEPTED' ? 'RECEIVED' : 'ISOLATED';
     sample.receivedAt = input.receivedAt;
     sample.version += 1;
     this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'sample.received', entity: 'container', entityId: container.id, metadata: { decision: input.decision, sealStatus: input.sealStatus, receivingId: id } });
     this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'sample.received', aggregateId: sample.id, payload: JSON.stringify({ sampleId: sample.id, containerId: container.id, decision: input.decision }) });
     return record;
+  }
+
+  private sameReceivePayload(existing: ReceivingRecord, input: ReceiveInput): boolean {
+    return existing.containerId === input.containerId
+      && existing.decision === input.decision
+      && existing.receivedBy === input.receivedBy
+      && existing.receivedAt === input.receivedAt
+      && existing.temperatureCelsius === input.temperatureCelsius
+      && existing.sealStatus === input.sealStatus
+      && (existing.reason ?? null) === (input.reason ?? null);
   }
 }

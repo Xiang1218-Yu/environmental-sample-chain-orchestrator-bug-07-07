@@ -16,7 +16,7 @@ export type BatchStatus = 'DRAFT' | 'READY' | 'RUNNING' | 'RESULTS_PENDING' | 'U
 export type RunStatus = 'REGISTERED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 export type QualityDecisionType = 'APPROVED' | 'REJECTED' | 'RETEST_REQUIRED';
 export type EvidenceStatus = 'GENERATING' | 'READY' | 'FAILED' | 'FROZEN';
-export type SyncApplyResult = 'APPLIED' | 'DUPLICATE' | 'CONFLICT' | 'STALE';
+export type SyncApplyResult = 'APPLIED' | 'DUPLICATE' | 'CONFLICT' | 'STALE' | 'REJECTED';
 
 export interface Versioned {
   version: number;

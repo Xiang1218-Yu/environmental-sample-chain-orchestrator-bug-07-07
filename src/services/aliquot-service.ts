@@ -1,10 +1,9 @@
 import type { Aliquot } from '../domain/types.js';
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { type Scope, assertScope, assertValidScope } from '../domain/scope.js';
 import { Store } from '../store/store.js';
 
-export interface AliquotRequest {
-  tenantId: string;
-  projectId: string;
+export interface AliquotRequest extends Scope {
   parentContainerId: string;
   protocolVersion: string;
   createdBy: string;
@@ -16,10 +15,17 @@ export class AliquotService {
   constructor(private readonly store: Store) {}
 
   createMany(input: AliquotRequest): Aliquot[] {
-    const prior = [...this.store.aliquots.values()].filter((item) => item.sourceOperationId === input.operationId && item.projectId === input.projectId);
-    if (prior.length > 0) return prior;
+    assertValidScope(input);
+    // 操作号幂等域为 (tenant, project)。
+    const prior = [...this.store.aliquots.values()].filter((item) => item.tenantId === input.tenantId && item.projectId === input.projectId && item.sourceOperationId === input.operationId);
+    if (prior.length > 0) {
+      if (!this.sameOperationPayload(prior, input)) {
+        throw new DomainError('aliquot.op_conflict', 'aliquot operation id was submitted with a different container or item set');
+      }
+      return prior;
+    }
     const container = assertFound(this.store.containers.get(input.parentContainerId), 'aliquot.container_not_found', 'parent container not found');
-    assertCondition(container.tenantId === input.tenantId && container.projectId === input.projectId, 'scope.forbidden', 'container is outside the requested project');
+    assertScope(container, input);
     assertCondition(container.custodyStatus === 'RELEASED_TO_LAB', 'aliquot.container_not_released', 'container has not been released to the laboratory');
     assertCondition(container.sealStatus === 'INTACT' || container.sealStatus === 'RESEALED', 'aliquot.seal_invalid', 'container seal is not acceptable for aliquoting');
     assertCondition(input.items.length > 0, 'aliquot.empty_request', 'at least one aliquot is required');
@@ -29,8 +35,9 @@ export class AliquotService {
     const duplicateBarcode = normalized.find((item, index) => normalized.findIndex((candidate) => candidate.barcode === item.barcode) !== index);
     assertCondition(!duplicateBarcode, 'aliquot.duplicate_barcode', 'aliquot barcodes must be unique within an operation');
     for (const item of normalized) {
-      const existing = [...this.store.aliquots.values()].find((aliquot) => aliquot.barcode === item.barcode);
-      if (existing) throw new Error(`aliquot barcode already exists: ${item.barcode}`);
+      // 分装条码只要求 (tenant, project) 内唯一；其他项目允许使用相同条码。
+      const existing = [...this.store.aliquots.values()].find((aliquot) => aliquot.tenantId === input.tenantId && aliquot.projectId === input.projectId && aliquot.barcode === item.barcode);
+      if (existing) throw new DomainError('aliquot.barcode_conflict', `aliquot barcode already exists in this project: ${item.barcode}`);
     }
     const created: Aliquot[] = [];
     for (const item of normalized) {
@@ -59,13 +66,26 @@ export class AliquotService {
     return created;
   }
 
-  allocate(aliquotId: string, batchId: string): Aliquot {
+  allocate(aliquotId: string, batchId: string, scope: Scope): Aliquot {
+    assertValidScope(scope);
     const aliquot = assertFound(this.store.aliquots.get(aliquotId), 'aliquot.not_found', 'aliquot not found');
+    assertScope(aliquot, scope);
+    const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
+    assertScope(batch, scope);
     assertCondition(aliquot.status === 'AVAILABLE', 'aliquot.not_available', 'aliquot is not available');
     aliquot.status = 'ALLOCATED';
     aliquot.version += 1;
-    this.store.addAudit({ tenantId: aliquot.tenantId, projectId: aliquot.projectId, action: 'aliquot.allocated', entity: 'aliquot', entityId: aliquot.id, metadata: { batchId } });
+    this.store.addAudit({ tenantId: scope.tenantId, projectId: scope.projectId, action: 'aliquot.allocated', entity: 'aliquot', entityId: aliquot.id, metadata: { batchId } });
     return aliquot;
+  }
+
+  private sameOperationPayload(prior: Aliquot[], input: AliquotRequest): boolean {
+    if (prior.some((item) => item.parentContainerId !== input.parentContainerId || item.protocolVersion !== input.protocolVersion || item.createdBy !== input.createdBy)) {
+      return false;
+    }
+    const expected = input.items.map((item) => `${item.barcode}:${this.toMilliliters(item.volumeMl, item.unit)}`).sort();
+    const actual = prior.map((item) => `${item.barcode}:${item.volumeMl}`).sort();
+    return expected.length === actual.length && expected.every((value, index) => value === actual[index]);
   }
 
   private toMilliliters(value: number, unit: 'ML' | 'G' | 'L'): number {

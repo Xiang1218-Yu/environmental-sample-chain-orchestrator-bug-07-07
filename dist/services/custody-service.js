@@ -1,15 +1,23 @@
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { assertScope, assertValidScope } from '../domain/scope.js';
 export class CustodyService {
     store;
     constructor(store) {
         this.store = store;
     }
     handOver(input) {
-        const duplicate = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId);
-        if (duplicate)
+        assertValidScope(input);
+        // 客户端操作号的幂等域是 (tenant, project)。同号不同内容是冲突，
+        // 不允许把 A 容器的交出请求静默重放成 B 容器的结果。
+        const duplicate = [...this.store.transfers.values()].find((item) => item.tenantId === input.tenantId && item.projectId === input.projectId && item.clientOperationId === input.clientOperationId);
+        if (duplicate) {
+            if (!this.sameHandoverPayload(duplicate, input)) {
+                throw new DomainError('custody.op_conflict', 'client operation id was submitted with a different handover payload');
+            }
             return duplicate;
+        }
         const container = assertFound(this.store.containers.get(input.containerId), 'custody.container_not_found', 'container not found');
-        this.assertScope(container.tenantId, container.projectId, input.tenantId, input.projectId);
+        assertScope(container, input);
         assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
         assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
         const prior = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId).sort((a, b) => b.transferSequence - a.transferSequence)[0];
@@ -41,9 +49,12 @@ export class CustodyService {
         this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.handed-over', aggregateId: container.id, payload: JSON.stringify({ transferId: transfer.id, transferSequence: transfer.transferSequence, containerId: container.id }) });
         return transfer;
     }
-    confirmReceipt(transferId, input) {
-        const transfer = assertFound(this.store.transfers.get(transferId), 'custody.transfer_not_found', 'transfer not found');
+    confirmReceipt(input) {
+        assertValidScope(input);
+        const transfer = assertFound(this.store.transfers.get(input.transferId), 'custody.transfer_not_found', 'transfer not found');
+        assertScope(transfer, input);
         const container = assertFound(this.store.containers.get(transfer.containerId), 'custody.container_not_found', 'container not found');
+        assertScope(container, input);
         if (transfer.status === 'CONFIRMED' || transfer.status === 'ISOLATED')
             return transfer;
         assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
@@ -56,11 +67,18 @@ export class CustodyService {
         container.sealStatus = input.sealStatus;
         container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
         container.version += 1;
-        this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
-        this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
+        this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
+        this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId: input.transferId, containerId: container.id, status: transfer.status }) });
         return transfer;
     }
-    assertScope(actualTenant, actualProject, tenantId, projectId) {
-        assertCondition(actualTenant === tenantId && actualProject === projectId, 'scope.forbidden', 'object does not belong to the requested project');
+    sameHandoverPayload(existing, input) {
+        return existing.containerId === input.containerId
+            && existing.fromHolderId === input.fromHolderId
+            && existing.toHolderId === input.toHolderId
+            && existing.fromLocation === input.fromLocation
+            && existing.toLocation === input.toLocation
+            && existing.handedOverAt === input.handedOverAt
+            && existing.temperatureCelsius === input.temperatureCelsius
+            && existing.sealStatus === input.sealStatus;
     }
 }
