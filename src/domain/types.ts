@@ -197,7 +197,8 @@ export interface SyncEnvelope {
   deviceId: string;
   clientSequence: number;
   operationId: string;
-  entityId: string;
+  /** Optional client hint; server-side ids are derived from the payload. */
+  entityId?: string;
   baseVersion: number;
   type: 'CREATE_SAMPLE' | 'CUSTODY_TRANSFER' | 'RECEIVE_CONTAINER' | 'CREATE_ALIQUOT';
   payloadHash: string;

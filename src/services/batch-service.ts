@@ -1,21 +1,35 @@
 import type { AnalysisBatch, ControlRequirement } from '../domain/types.js';
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition } from '../domain/errors.js';
 import { Store } from '../store/store.js';
 import { AliquotService } from './aliquot-service.js';
+import { assertInScope, assertValidScope, sameScope, type Scope } from '../domain/scope.js';
 
-export interface CreateBatchInput {
-  tenantId: string;
-  projectId: string;
+export interface CreateBatchInput extends Scope {
   protocolVersion: string;
   instrumentType: string;
   requiredControls: ControlRequirement[];
   createdBy: string;
 }
 
+export interface BatchRef extends Scope {
+  batchId: string;
+}
+
+export interface AddAliquotInput extends Scope {
+  batchId: string;
+  aliquotId: string;
+}
+
+export interface AttachControlInput extends Scope {
+  batchId: string;
+  resultId: string;
+}
+
 export class BatchService {
   constructor(private readonly store: Store, private readonly aliquots: AliquotService) {}
 
   create(input: CreateBatchInput): AnalysisBatch {
+    assertValidScope(input);
     assertCondition(input.requiredControls.every((control) => control.minimumCount > 0), 'batch.invalid_controls', 'control minimums must be positive');
     const batch: AnalysisBatch = {
       id: this.store.nextId('batch'),
@@ -36,48 +50,57 @@ export class BatchService {
     return batch;
   }
 
-  addAliquot(batchId: string, aliquotId: string): AnalysisBatch {
-    const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
-    const aliquot = assertFound(this.store.aliquots.get(aliquotId), 'aliquot.not_found', 'aliquot not found');
-    assertCondition(batch.tenantId === aliquot.tenantId && batch.projectId === aliquot.projectId, 'scope.forbidden', 'batch and aliquot belong to different projects');
+  addAliquot(input: AddAliquotInput): AnalysisBatch {
+    assertValidScope(input);
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
+    const aliquot = assertInScope(this.store.aliquots.get(input.aliquotId), input, 'aliquot.not_found', 'aliquot not found');
+    // sameScope is guaranteed above; keep an explicit guard for future indexes.
+    assertCondition(sameScope(batch, aliquot), 'scope.forbidden', 'batch and aliquot belong to different projects');
     assertCondition(batch.status === 'DRAFT' || batch.status === 'READY', 'batch.members_locked', 'batch members are locked after execution starts');
-    if (!batch.memberAliquotIds.includes(aliquotId)) {
-      this.aliquots.allocate(aliquotId, batchId);
-      batch.memberAliquotIds.push(aliquotId);
+    if (!batch.memberAliquotIds.includes(input.aliquotId)) {
+      this.aliquots.allocate(input.aliquotId, input.batchId);
+      batch.memberAliquotIds.push(input.aliquotId);
       batch.version += 1;
     }
     return batch;
   }
 
-  markReady(batchId: string): AnalysisBatch {
-    const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
+  markReady(input: BatchRef): AnalysisBatch {
+    assertValidScope(input);
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
     assertCondition(batch.status === 'DRAFT' && batch.memberAliquotIds.length > 0, 'batch.not_ready', 'batch needs at least one aliquot before it can be prepared');
     batch.status = 'READY';
     batch.version += 1;
-    this.store.addAudit({ tenantId: batch.tenantId, projectId: batch.projectId, action: 'batch.ready', entity: 'batch', entityId: batch.id, metadata: { memberCount: batch.memberAliquotIds.length } });
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'batch.ready', entity: 'batch', entityId: batch.id, metadata: { memberCount: batch.memberAliquotIds.length } });
     return batch;
   }
 
-  start(batchId: string, startedAt: string): AnalysisBatch {
-    const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
+  start(input: BatchRef & { startedAt: string }): AnalysisBatch {
+    assertValidScope(input);
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
     assertCondition(batch.status === 'READY', 'batch.invalid_start', 'only ready batches can start');
     batch.status = 'RUNNING';
-    batch.startedAt = startedAt;
-    batch.frozenAt = startedAt;
+    batch.startedAt = input.startedAt;
+    batch.frozenAt = input.startedAt;
     batch.version += 1;
     for (const aliquotId of batch.memberAliquotIds) {
-      const aliquot = assertFound(this.store.aliquots.get(aliquotId), 'aliquot.not_found', 'batch member aliquot not found');
+      const aliquot = assertInScope(this.store.aliquots.get(aliquotId), input, 'aliquot.not_found', 'batch member aliquot not found');
       assertCondition(aliquot.status === 'ALLOCATED', 'batch.member_not_allocated', 'all batch members must be allocated');
     }
-    this.store.addAudit({ tenantId: batch.tenantId, projectId: batch.projectId, action: 'batch.started', entity: 'batch', entityId: batch.id, metadata: { protocolVersion: batch.protocolVersion } });
-    this.store.addOutbox({ tenantId: batch.tenantId, projectId: batch.projectId, topic: 'batch.started', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, version: batch.version }) });
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'batch.started', entity: 'batch', entityId: batch.id, metadata: { protocolVersion: batch.protocolVersion } });
+    this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'batch.started', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, version: batch.version }) });
     return batch;
   }
 
-  attachControlResult(batchId: string, resultId: string): void {
-    const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
-    assertCondition(!batch.controlResultIds.includes(resultId), 'batch.duplicate_control', 'control result already attached');
-    batch.controlResultIds.push(resultId);
+  attachControlResult(input: AttachControlInput): void {
+    assertValidScope(input);
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
+    // A control result from another project/tenant can never be attached here.
+    const result = assertInScope(this.store.results.get(input.resultId), input, 'quality.result_not_found', 'result not found');
+    assertCondition(result.batchId === batch.id, 'batch.control_batch_mismatch', 'control result belongs to a different batch');
+    assertCondition(!batch.controlResultIds.includes(input.resultId), 'batch.duplicate_control', 'control result already attached');
+    batch.controlResultIds.push(input.resultId);
     batch.version += 1;
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'batch.control_attached', entity: 'batch', entityId: batch.id, metadata: { resultId: input.resultId } });
   }
 }

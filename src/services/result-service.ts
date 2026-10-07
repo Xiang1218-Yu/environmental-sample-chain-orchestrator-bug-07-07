@@ -1,10 +1,9 @@
 import type { InstrumentRun, ResultRevision } from '../domain/types.js';
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition } from '../domain/errors.js';
 import { Store } from '../store/store.js';
+import { assertInScope, assertValidScope, sameScope, type Scope } from '../domain/scope.js';
 
-export interface RegisterRunInput {
-  tenantId: string;
-  projectId: string;
+export interface RegisterRunInput extends Scope {
   batchId: string;
   externalRunId: string;
   rawFileHash: string;
@@ -12,9 +11,13 @@ export interface RegisterRunInput {
   startedAt: string;
 }
 
-export interface ResultInput {
-  tenantId: string;
-  projectId: string;
+export interface CompleteRunInput extends Scope {
+  runId: string;
+  completedAt: string;
+  status: 'COMPLETED' | 'FAILED';
+}
+
+export interface ResultInput extends Scope {
   batchId: string;
   runId: string;
   aliquotId?: string;
@@ -32,13 +35,24 @@ export class ResultService {
   constructor(private readonly store: Store) {}
 
   registerRun(input: RegisterRunInput): InstrumentRun {
-    const existing = [...this.store.runs.values()].find((run) => run.projectId === input.projectId && run.externalRunId === input.externalRunId);
+    assertValidScope(input);
+    // External run ids are unique only within (tenant, project): the same run
+    // id may legitimately appear in another project. Resolve the batch first so
+    // a wrong-scope request can never attach its run to this project's batch.
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
+
+    const existing = this.store.findScoped(
+      this.store.runs.values(),
+      (run) => run.externalRunId === input.externalRunId,
+      input,
+    );
     if (existing) {
+      // Same project + same external run id but a different raw file is a
+      // conflict; identical raw file is an idempotent replay.
       assertCondition(existing.rawFileHash === input.rawFileHash, 'result.run_conflict', 'external run id has a different raw file');
       return existing;
     }
-    const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
-    assertCondition(batch.tenantId === input.tenantId && batch.projectId === input.projectId, 'scope.forbidden', 'batch is outside the requested project');
+
     assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING', 'result.batch_not_running', 'batch is not accepting instrument runs');
     const run: InstrumentRun = { id: this.store.nextId('run'), tenantId: input.tenantId, projectId: input.projectId, batchId: input.batchId, externalRunId: input.externalRunId, rawFileHash: input.rawFileHash, instrumentSoftwareVersion: input.instrumentSoftwareVersion, startedAt: input.startedAt, status: 'REGISTERED', version: 1 };
     this.store.runs.set(run.id, run);
@@ -48,19 +62,26 @@ export class ResultService {
     return run;
   }
 
-  completeRun(runId: string, completedAt: string, status: 'COMPLETED' | 'FAILED'): InstrumentRun {
-    const run = assertFound(this.store.runs.get(runId), 'result.run_not_found', 'instrument run not found');
+  completeRun(input: CompleteRunInput): InstrumentRun {
+    assertValidScope(input);
+    const run = assertInScope(this.store.runs.get(input.runId), input, 'result.run_not_found', 'instrument run not found');
     assertCondition(run.status === 'REGISTERED' || run.status === 'RUNNING', 'result.run_closed', 'instrument run is already closed');
-    run.status = status;
-    run.completedAt = completedAt;
+    run.status = input.status;
+    run.completedAt = input.completedAt;
     run.version += 1;
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'instrument.run_completed', entity: 'run', entityId: run.id, metadata: { status: input.status } });
     return run;
   }
 
   ingestRevision(input: ResultInput): ResultRevision {
-    const run = assertFound(this.store.runs.get(input.runId), 'result.run_not_found', 'instrument run not found');
-    const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
-    assertCondition(run.batchId === batch.id && run.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'result does not belong to the requested batch');
+    assertValidScope(input);
+    const run = assertInScope(this.store.runs.get(input.runId), input, 'result.run_not_found', 'instrument run not found');
+    const batch = assertInScope(this.store.batches.get(input.batchId), input, 'batch.not_found', 'batch not found');
+    assertCondition(run.batchId === batch.id && sameScope(run, batch), 'scope.forbidden', 'result does not belong to the requested batch');
+    if (input.aliquotId !== undefined) {
+      const aliquot = assertInScope(this.store.aliquots.get(input.aliquotId), input, 'aliquot.not_found', 'aliquot not found');
+      assertCondition(batch.memberAliquotIds.includes(aliquot.id), 'result.aliquot_not_in_batch', 'aliquot is not a member of the target batch');
+    }
     const current = this.findCurrent(input);
     if (current) {
       if (current.contentHash === input.contentHash) return current;
@@ -93,7 +114,7 @@ export class ResultService {
       version: 1,
     };
     if (supersedesRevisionId) {
-      const prior = assertFound(this.store.results.get(supersedesRevisionId), 'result.previous_missing', 'previous result revision not found');
+      const prior = assertInScope(this.store.results.get(supersedesRevisionId), input, 'result.previous_missing', 'previous result revision not found');
       prior.status = 'SUPERSEDED';
       prior.version += 1;
     }
@@ -104,10 +125,14 @@ export class ResultService {
   }
 
   private findCurrent(input: ResultInput): ResultRevision | undefined {
-    return [...this.store.results.values()].filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind && result.status === 'CURRENT').sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
+    return this.store.inScope(this.store.results.values(), input)
+      .filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind && result.status === 'CURRENT')
+      .sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
   }
 
   private findNextRevision(input: ResultInput, current: ResultRevision): number {
-    return Math.max(current.revisionNumber + 1, ...[...this.store.results.values()].filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind).map((result) => result.revisionNumber + 1));
+    return Math.max(current.revisionNumber + 1, ...this.store.inScope(this.store.results.values(), input)
+      .filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind)
+      .map((result) => result.revisionNumber + 1));
   }
 }

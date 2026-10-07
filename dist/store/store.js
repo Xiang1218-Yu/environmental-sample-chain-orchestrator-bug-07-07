@@ -1,3 +1,4 @@
+import { scopedIdKey } from '../domain/scope.js';
 class Mutex {
     tail = Promise.resolve();
     async runExclusive(work) {
@@ -14,6 +15,12 @@ class Mutex {
     }
 }
 export class Store {
+    /**
+     * Samples are keyed by (tenant, project, sample id): a client-supplied
+     * sample id may legally exist in several projects at once. Every other
+     * aggregate uses server-generated globally unique ids, but lookups still
+     * go through the scoped finders below.
+     */
     samples = new Map();
     containers = new Map();
     transfers = new Map();
@@ -34,6 +41,35 @@ export class Store {
     nextId(prefix) {
         this.sequence += 1;
         return `${prefix}_${this.sequence.toString().padStart(8, '0')}`;
+    }
+    // ---- scoped sample index -------------------------------------------------
+    sampleKey(scope, sampleId) {
+        return scopedIdKey(scope, sampleId);
+    }
+    putSample(sample) {
+        this.samples.set(this.sampleKey(sample, sample.id), sample);
+    }
+    findSample(sampleId, scope) {
+        return this.samples.get(this.sampleKey(scope, sampleId));
+    }
+    listSamples(scope) {
+        return [...this.samples.values()].filter((item) => item.tenantId === scope.tenantId && item.projectId === scope.projectId);
+    }
+    // ---- scoped collection helpers ------------------------------------------
+    inScope(values, scope) {
+        const result = [];
+        for (const value of values) {
+            if (value.tenantId === scope.tenantId && value.projectId === scope.projectId)
+                result.push(value);
+        }
+        return result;
+    }
+    findScoped(values, predicate, scope) {
+        for (const value of values) {
+            if (value.tenantId === scope.tenantId && value.projectId === scope.projectId && predicate(value))
+                return value;
+        }
+        return undefined;
     }
     addAudit(input) {
         const record = { ...input, id: this.nextId('audit'), createdAt: this.now() };
@@ -66,7 +102,9 @@ export class Store {
     }
     restore(snapshot) {
         this.sequence = snapshot.sequence;
-        this.replaceMap(this.samples, snapshot.samples);
+        this.samples.clear();
+        for (const sample of snapshot.samples)
+            this.putSample(sample);
         this.replaceMap(this.containers, snapshot.containers);
         this.replaceMap(this.transfers, snapshot.transfers);
         this.replaceMap(this.receiving, snapshot.receiving);

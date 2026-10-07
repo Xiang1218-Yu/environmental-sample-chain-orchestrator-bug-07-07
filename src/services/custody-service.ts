@@ -1,10 +1,9 @@
 import type { CustodyTransfer, SealStatus } from '../domain/types.js';
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition, DomainError } from '../domain/errors.js';
 import { Store } from '../store/store.js';
+import { assertInScope, assertValidScope, type Scope } from '../domain/scope.js';
 
-export interface HandoverInput {
-  tenantId: string;
-  projectId: string;
+export interface HandoverInput extends Scope {
   containerId: string;
   fromHolderId: string;
   toHolderId: string;
@@ -16,17 +15,40 @@ export interface HandoverInput {
   clientOperationId: string;
 }
 
+export interface ConfirmReceiptInput extends Scope {
+  receiverId: string;
+  receivedAt: string;
+  temperatureCelsius: number;
+  sealStatus: SealStatus;
+}
+
 export class CustodyService {
   constructor(private readonly store: Store) {}
 
   handOver(input: HandoverInput): CustodyTransfer {
-    const duplicate = [...this.store.transfers.values()].find((item) => item.clientOperationId === input.clientOperationId && item.projectId === input.projectId);
-    if (duplicate) return duplicate;
-    const container = assertFound(this.store.containers.get(input.containerId), 'custody.container_not_found', 'container not found');
-    this.assertScope(container.tenantId, container.projectId, input.tenantId, input.projectId);
+    assertValidScope(input);
+    // Resolve and authorise the aggregate before any idempotency shortcut so a
+    // request from another project can never confirm/return this project's
+    // transfer or mutate the container.
+    const container = assertInScope(this.store.containers.get(input.containerId), input, 'custody.container_not_found', 'container not found');
+
+    const duplicate = this.store.findScoped(
+      this.store.transfers.values(),
+      (item) => item.clientOperationId === input.clientOperationId,
+      input,
+    );
+    if (duplicate) {
+      if (this.handoverSignature(input, container.barcode) !== this.duplicateSignature(duplicate)) {
+        throw new DomainError('custody.operation_conflict', 'client operation id was already used in this project with a different payload');
+      }
+      return duplicate;
+    }
+
     assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
     assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
-    const prior = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId).sort((a, b) => b.transferSequence - a.transferSequence)[0];
+    const prior = this.store.inScope(this.store.transfers.values(), input)
+      .filter((item) => item.containerId === input.containerId)
+      .sort((a, b) => b.transferSequence - a.transferSequence)[0];
     const transfer: CustodyTransfer = {
       id: this.store.nextId('transfer'),
       tenantId: input.tenantId,
@@ -56,9 +78,10 @@ export class CustodyService {
     return transfer;
   }
 
-  confirmReceipt(transferId: string, input: { receiverId: string; receivedAt: string; temperatureCelsius: number; sealStatus: SealStatus }): CustodyTransfer {
-    const transfer = assertFound(this.store.transfers.get(transferId), 'custody.transfer_not_found', 'transfer not found');
-    const container = assertFound(this.store.containers.get(transfer.containerId), 'custody.container_not_found', 'container not found');
+  confirmReceipt(transferId: string, input: ConfirmReceiptInput): CustodyTransfer {
+    assertValidScope(input);
+    const transfer = assertInScope(this.store.transfers.get(transferId), input, 'custody.transfer_not_found', 'transfer not found');
+    const container = assertInScope(this.store.containers.get(transfer.containerId), input, 'custody.container_not_found', 'container not found');
     if (transfer.status === 'CONFIRMED' || transfer.status === 'ISOLATED') return transfer;
     assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
     assertCondition(transfer.toHolderId === input.receiverId, 'custody.receiver_mismatch', 'receiver does not match the transfer');
@@ -70,12 +93,17 @@ export class CustodyService {
     container.sealStatus = input.sealStatus;
     container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
     container.version += 1;
-    this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
-    this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
+    this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
     return transfer;
   }
 
-  private assertScope(actualTenant: string, actualProject: string, tenantId: string, projectId: string): void {
-    assertCondition(actualTenant === tenantId && actualProject === projectId, 'scope.forbidden', 'object does not belong to the requested project');
+  private handoverSignature(input: HandoverInput, barcode: string): string {
+    return JSON.stringify([input.containerId, barcode, input.fromHolderId, input.toHolderId, input.fromLocation, input.toLocation, input.handedOverAt, input.temperatureCelsius, input.sealStatus]);
+  }
+
+  private duplicateSignature(transfer: CustodyTransfer): string {
+    const container = this.store.containers.get(transfer.containerId);
+    return JSON.stringify([transfer.containerId, container?.barcode, transfer.fromHolderId, transfer.toHolderId, transfer.fromLocation, transfer.toLocation, transfer.handedOverAt, transfer.temperatureCelsius, transfer.sealStatus]);
   }
 }

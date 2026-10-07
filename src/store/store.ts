@@ -2,6 +2,7 @@ import type {
   Aliquot, AnalysisBatch, AuditRecord, CustodyTransfer, EvidencePackage, FileRecord, InstrumentRun, OutboxMessage,
   QualityDecision, ReceivingRecord, ResultRevision, SampleContainer, SamplingRecord, SyncRecord,
 } from '../domain/types.js';
+import { scopedIdKey, type Scope, type Scoped } from '../domain/scope.js';
 
 class Mutex {
   private tail = Promise.resolve();
@@ -38,6 +39,12 @@ type Snapshot = {
 };
 
 export class Store {
+  /**
+   * Samples are keyed by (tenant, project, sample id): a client-supplied
+   * sample id may legally exist in several projects at once. Every other
+   * aggregate uses server-generated globally unique ids, but lookups still
+   * go through the scoped finders below.
+   */
   readonly samples = new Map<string, SamplingRecord>();
   readonly containers = new Map<string, SampleContainer>();
   readonly transfers = new Map<string, CustodyTransfer>();
@@ -60,6 +67,41 @@ export class Store {
   nextId(prefix: string): string {
     this.sequence += 1;
     return `${prefix}_${this.sequence.toString().padStart(8, '0')}`;
+  }
+
+  // ---- scoped sample index -------------------------------------------------
+
+  sampleKey(scope: Scope, sampleId: string): string {
+    return scopedIdKey(scope, sampleId);
+  }
+
+  putSample(sample: SamplingRecord): void {
+    this.samples.set(this.sampleKey(sample, sample.id), sample);
+  }
+
+  findSample(sampleId: string, scope: Scope): SamplingRecord | undefined {
+    return this.samples.get(this.sampleKey(scope, sampleId));
+  }
+
+  listSamples(scope: Scope): SamplingRecord[] {
+    return [...this.samples.values()].filter((item) => item.tenantId === scope.tenantId && item.projectId === scope.projectId);
+  }
+
+  // ---- scoped collection helpers ------------------------------------------
+
+  inScope<T extends Scoped>(values: Iterable<T>, scope: Scope): T[] {
+    const result: T[] = [];
+    for (const value of values) {
+      if (value.tenantId === scope.tenantId && value.projectId === scope.projectId) result.push(value);
+    }
+    return result;
+  }
+
+  findScoped<T extends Scoped>(values: Iterable<T>, predicate: (value: T) => boolean, scope: Scope): T | undefined {
+    for (const value of values) {
+      if (value.tenantId === scope.tenantId && value.projectId === scope.projectId && predicate(value)) return value;
+    }
+    return undefined;
   }
 
   addAudit(input: Omit<AuditRecord, 'id' | 'createdAt'>): AuditRecord {
@@ -96,7 +138,8 @@ export class Store {
 
   restore(snapshot: Snapshot): void {
     this.sequence = snapshot.sequence;
-    this.replaceMap(this.samples, snapshot.samples);
+    this.samples.clear();
+    for (const sample of snapshot.samples) this.putSample(sample);
     this.replaceMap(this.containers, snapshot.containers);
     this.replaceMap(this.transfers, snapshot.transfers);
     this.replaceMap(this.receiving, snapshot.receiving);

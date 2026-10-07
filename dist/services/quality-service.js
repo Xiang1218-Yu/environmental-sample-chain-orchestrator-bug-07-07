@@ -1,15 +1,17 @@
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition } from '../domain/errors.js';
+import { assertInScope, assertValidScope, sameScope } from '../domain/scope.js';
 export class QualityService {
     store;
     constructor(store) {
         this.store = store;
     }
     decide(input) {
-        const result = assertFound(this.store.results.get(input.resultId), 'quality.result_not_found', 'result not found');
-        const batch = assertFound(this.store.batches.get(input.batchId), 'quality.batch_not_found', 'batch not found');
-        assertCondition(result.batchId === batch.id && result.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'quality decision is outside the requested project');
+        assertValidScope(input);
+        const result = assertInScope(this.store.results.get(input.resultId), input, 'quality.result_not_found', 'result not found');
+        const batch = assertInScope(this.store.batches.get(input.batchId), input, 'quality.batch_not_found', 'batch not found');
+        assertCondition(result.batchId === batch.id && sameScope(result, batch), 'scope.forbidden', 'quality decision is outside the requested project');
         assertCondition(result.status === 'CURRENT', 'quality.result_not_current', 'only the current result revision can be reviewed');
-        const previous = [...this.store.quality.values()].find((decision) => decision.resultId === result.id && decision.projectId === input.projectId && decision.decision === input.decision && decision.ruleVersion === input.ruleVersion);
+        const previous = this.store.findScoped(this.store.quality.values(), (decision) => decision.resultId === result.id && decision.decision === input.decision && decision.ruleVersion === input.ruleVersion, input);
         if (previous)
             return previous;
         const decision = {
@@ -38,10 +40,11 @@ export class QualityService {
         this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'quality.decision-recorded', aggregateId: result.id, payload: JSON.stringify({ decisionId: decision.id, resultId: result.id, decision: input.decision }) });
         return decision;
     }
-    approveBatch(batchId, reviewerId) {
-        const batch = assertFound(this.store.batches.get(batchId), 'quality.batch_not_found', 'batch not found');
+    approveBatch(input) {
+        assertValidScope(input);
+        const batch = assertInScope(this.store.batches.get(input.batchId), input, 'quality.batch_not_found', 'batch not found');
         assertCondition(batch.status === 'RESULTS_PENDING' || batch.status === 'UNDER_REVIEW', 'quality.batch_not_reviewable', 'batch is not ready for approval');
-        const currentResults = [...this.store.results.values()].filter((result) => result.batchId === batch.id && result.status === 'CURRENT');
+        const currentResults = this.store.inScope(this.store.results.values(), input).filter((result) => result.batchId === batch.id && result.status === 'CURRENT');
         assertCondition(currentResults.length > 0, 'quality.no_results', 'batch has no current results');
         const controlKinds = new Map();
         for (const result of currentResults) {
@@ -52,13 +55,13 @@ export class QualityService {
             assertCondition((controlKinds.get(requirement.kind) ?? 0) >= requirement.minimumCount, 'quality.control_missing', `missing control: ${requirement.kind}`);
         }
         for (const result of currentResults) {
-            const decisions = [...this.store.quality.values()].filter((decision) => decision.resultId === result.id && decision.decision === 'APPROVED');
+            const decisions = this.store.inScope(this.store.quality.values(), input).filter((decision) => decision.resultId === result.id && decision.decision === 'APPROVED');
             assertCondition(decisions.length > 0, 'quality.result_unapproved', `result ${result.id} has not been approved`);
         }
         batch.status = 'APPROVED';
         batch.approvedAt = this.store.now();
         batch.version += 1;
-        this.store.addAudit({ tenantId: batch.tenantId, projectId: batch.projectId, action: 'batch.approved', entity: 'batch', entityId: batch.id, metadata: { reviewerId, resultCount: currentResults.length } });
-        this.store.addOutbox({ tenantId: batch.tenantId, projectId: batch.projectId, topic: 'batch.approved', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, reviewerId }) });
+        this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'batch.approved', entity: 'batch', entityId: batch.id, metadata: { reviewerId: input.reviewerId, resultCount: currentResults.length } });
+        this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'batch.approved', aggregateId: batch.id, payload: JSON.stringify({ batchId: batch.id, reviewerId: input.reviewerId }) });
     }
 }
